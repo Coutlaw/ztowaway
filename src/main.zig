@@ -1,27 +1,25 @@
 const std = @import("std");
+const Io = std.Io;
+
 const ztowaway = @import("ztowaway");
+const network = @import("network.zig");
+const log_level: std.log.default_level = .debug;
 
 pub fn main() !void {
-    // Prints to stderr, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
-    try ztowaway.bufferedPrint();
-}
+    const host_info = try network.GetHostInterfaceInfo("wlan0");
+    std.debug.print("MAC: {X:0>2}:{X:0>2}:{X:0>2}:{X:0>2}:{X:0>2}:{X:0>2}\n", .{
+        host_info.macaddr[0], host_info.macaddr[1], host_info.macaddr[2], host_info.macaddr[3], host_info.macaddr[4], host_info.macaddr[5],
+    });
 
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
+    var main_allocator = std.heap.DebugAllocator(.{}){};
+    defer _ = main_allocator.deinit();
+    const allocator = main_allocator.allocator();
 
-test "fuzz example" {
-    const Context = struct {
-        fn testOne(context: @This(), input: []const u8) anyerror!void {
-            _ = context;
-            // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
-            try std.testing.expect(!std.mem.eql(u8, "canyoufindme", input));
-        }
-    };
-    try std.testing.fuzz(Context{}, Context.testOne, .{});
+    const usable_hosts = try network.GetSubnetHosts(allocator, host_info.ipaddr, host_info.netmask);
+    defer allocator.free(usable_hosts);
+
+    std.debug.print("Local Network IPs:\n", .{});
+    for (usable_hosts) |host| {
+        std.debug.print("{}.{}.{}.{}\n", .{ host[0], host[1], host[2], host[3] });
+    }
 }
