@@ -81,6 +81,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "ztowaway", .module = mod },
             },
         }),
+        .use_llvm = true,
     });
 
     // This declares intent for the executable to be installed into the
@@ -88,6 +89,12 @@ pub fn build(b: *std.Build) void {
     // step). By default the install prefix is `zig-out/` but can be overridden
     // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
+
+    const setcap = b.addSystemCommand(&.{ "sudo", "setcap", "cap_net_raw=eip" });
+    setcap.addArtifactArg(exe);
+    setcap.step.dependOn(b.getInstallStep());
+    const setcap_step = b.step("setcap", "Grant cap_net_raw to the installed binary");
+    setcap_step.dependOn(&setcap.step);
 
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).

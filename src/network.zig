@@ -7,6 +7,7 @@ const ETH_P_ARP = 0x0806;
 const ARP_P_TYPE = 0x0800;
 const ARPOP_REQUEST = 1;
 const ARPHRD_ETHER = 1;
+const ARPOP_REPLY = 2;
 
 // Layer 2 broadcast MAC
 pub const MACBroadcastAddr: [6]u8 = "FF:FF:FF:FF:FF:FF";
@@ -176,24 +177,40 @@ pub fn FormatDestSockAddr(iface: HostInterface) std.os.linux.sockaddr.ll {
 }
 
 //Eventually needs to return ![]KnownHost
-pub fn LocalNetworkArpScan(hostiface: []const u8, allocator: std.mem.Allocator) !void {
-    const host_socket: i32 = @intCast(std.os.linux.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0));
-    defer _ = std.os.linux.close(host_socket);
+pub fn LocalNetworkArpScan(hostiface: []const u8, allocator: std.mem.Allocator) ![]KnownHost {
+    const ioctl_socket: i32 = @intCast(std.os.linux.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0));
 
-    const host_network_interface = try GetHostInterfaceInfo(hostiface, host_socket);
+    const host_network_interface = try GetHostInterfaceInfo(hostiface, ioctl_socket);
     const usable_ips = try GetSubnetHosts(allocator, host_network_interface.ipaddr, host_network_interface.netmask);
     defer allocator.free(usable_ips);
+    _ = std.os.linux.close(ioctl_socket);
+
+    // AF_PACKET and ETH_P_ARP will allow ARP resonses to sit in this sockets recieve buffer
+    const raw_socket_rc = std.os.linux.socket(std.os.linux.AF.PACKET, std.posix.SOCK.RAW, std.mem.nativeToBig(u16, ETH_P_ARP));
+    if (std.os.linux.errno(raw_socket_rc) != .SUCCESS) {
+        log.debug("Error Number: {}", .{raw_socket_rc});
+        if (raw_socket_rc == 18446744073709551615) {
+            log.err("Missing the Capability to use raw socket hosts, run zig build setcap to rebuild binary", .{});
+            return error.RawSocketCapabilityMissing;
+        }
+
+        return error.SocketFailed;
+    }
+
+    const raw_socket: i32 = @intCast(raw_socket_rc);
+    defer _ = std.os.linux.close(raw_socket);
 
     const dest_sock_addr = FormatDestSockAddr(host_network_interface);
 
     // Ignore the target ip, it's just to get a non zero value
     var arpRequest = FormatArpRequest(host_network_interface, host_network_interface.ipaddr);
 
+    // Boardcast ARP to every known IP
     for (usable_ips) |target_ip| {
         arpRequest.arp.tpa = target_ip;
         const raw_msg = std.mem.asBytes(&arpRequest);
 
-        const resp = std.os.linux.sendto(host_socket, raw_msg, raw_msg.len, 0, @ptrCast(&dest_sock_addr), @sizeOf(@TypeOf(&dest_sock_addr)));
+        const resp = std.os.linux.sendto(raw_socket, raw_msg, raw_msg.len, 0, @ptrCast(&dest_sock_addr), @sizeOf(std.os.linux.sockaddr.ll));
         if (std.os.linux.errno(resp) != std.os.linux.E.SUCCESS) {
             log.warn("sendto failed for {}.{}.{}.{}: errno {}", .{
                 target_ip[0],             target_ip[1], target_ip[2], target_ip[3],
@@ -201,6 +218,37 @@ pub fn LocalNetworkArpScan(hostiface: []const u8, allocator: std.mem.Allocator) 
             });
         }
     }
+
+    var known_hosts = std.ArrayList(KnownHost).empty;
+    errdefer allocator.free(known_hosts);
+
+    var fds = [1]std.os.linux.pollfd{.{
+        .fd = raw_socket,
+        .events = std.os.linux.POLL.IN,
+        .revents = 0,
+    }};
+
+    var frame_buff: [@sizeOf(ArpFrame)]u8 = undefined;
+
+    while (true) {
+        const ready = std.os.linux.poll(&fds, 1, 1000); // 1ms
+        if (ready == 0) break;
+        if (std.os.linux.errno(ready) != .SUCCESS) break;
+
+        const n = std.os.linux.recvfrom(raw_socket, &frame_buff, frame_buff.len, 0, null, null);
+        if (std.os.linux.errno(n) != .SUCCESS) continue;
+        if (n < @sizeOf(ArpFrame)) continue;
+
+        const frame: *const ArpFrame = @ptrCast(&frame_buff);
+        if (frame.arp.oper != std.mem.nativeToBig(u16, ARPOP_REPLY)) continue;
+
+        try known_hosts.append(.{
+            .macaddr = frame.arp.sha,
+            .ipaddr = frame.arp.spa,
+        });
+    }
+
+    return known_hosts.toOwnedSlice();
 }
 
 test "subnet hosts happy path" {
