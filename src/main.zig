@@ -14,6 +14,7 @@ pub fn main() !void {
     const allocator = main_allocator.allocator();
 
     const responded_hosts = try network.LocalNetworkArpScan(interface_name, allocator);
+    defer allocator.free(responded_hosts);
     for (responded_hosts) |host| {
         log.info("Host Responded: {}", .{host});
     }

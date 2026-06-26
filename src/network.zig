@@ -219,8 +219,9 @@ pub fn LocalNetworkArpScan(hostiface: []const u8, allocator: std.mem.Allocator) 
         }
     }
 
-    var known_hosts = std.ArrayList(KnownHost).empty;
-    errdefer allocator.free(known_hosts);
+    // Unmanaged array list just creates explicit allocator handling and smaller struct
+    var known_hosts = std.ArrayListUnmanaged(KnownHost).empty;
+    defer known_hosts.deinit(allocator);
 
     var fds = [1]std.os.linux.pollfd{.{
         .fd = raw_socket,
@@ -228,7 +229,8 @@ pub fn LocalNetworkArpScan(hostiface: []const u8, allocator: std.mem.Allocator) 
         .revents = 0,
     }};
 
-    var frame_buff: [@sizeOf(ArpFrame)]u8 = undefined;
+    // Align here is just to help coerce the raw byte string into this structure without copying data
+    var frame_buff: [@sizeOf(ArpFrame)]u8 align(@alignOf(ArpFrame)) = undefined;
 
     while (true) {
         const ready = std.os.linux.poll(&fds, 1, 1000); // 1ms
@@ -242,13 +244,13 @@ pub fn LocalNetworkArpScan(hostiface: []const u8, allocator: std.mem.Allocator) 
         const frame: *const ArpFrame = @ptrCast(&frame_buff);
         if (frame.arp.oper != std.mem.nativeToBig(u16, ARPOP_REPLY)) continue;
 
-        try known_hosts.append(.{
+        try known_hosts.append(allocator, .{
             .macaddr = frame.arp.sha,
             .ipaddr = frame.arp.spa,
         });
     }
 
-    return known_hosts.toOwnedSlice();
+    return try known_hosts.toOwnedSlice(allocator);
 }
 
 test "subnet hosts happy path" {
