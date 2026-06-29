@@ -167,7 +167,7 @@ pub fn FormatArpRequest(iface: HostInterface, target_ip: [4]u8) ArpFrame {
 pub fn FormatDestSockAddr(iface: HostInterface) std.os.linux.sockaddr.ll {
     return .{
         .family = std.os.linux.AF.PACKET,
-        .protocol = ETH_P_ARP,
+        .protocol = std.mem.nativeToBig(u16, ETH_P_ARP),
         .ifindex = iface.ifindex,
         .hatype = ARPHRD_ETHER,
         .pkttype = 0,
@@ -205,6 +205,11 @@ pub fn LocalNetworkArpScan(hostiface: []const u8, allocator: std.mem.Allocator) 
     // Ignore the target ip, it's just to get a non zero value
     var arpRequest = FormatArpRequest(host_network_interface, host_network_interface.ipaddr);
 
+    // Track last sent packet
+    const last_usable_ip = usable_ips[usable_ips.len - 1];
+    const threaded_io: std.Io.Threaded = .init(allocator);
+    var last_sent_time: std.Io.Timestamp = std.Io.Clock.real.now(threaded_io);
+
     // Boardcast ARP to every known IP
     for (usable_ips) |target_ip| {
         arpRequest.arp.tpa = target_ip;
@@ -216,6 +221,14 @@ pub fn LocalNetworkArpScan(hostiface: []const u8, allocator: std.mem.Allocator) 
                 target_ip[0],             target_ip[1], target_ip[2], target_ip[3],
                 std.os.linux.errno(resp),
             });
+        }
+
+        // Pace sends by pauing for 1ms between each send and not overwhelming the TX buffer
+        // TODO: Could make this cooler by tracking TX buffer state and pacing dynamically
+        std.os.linux.nanosleep(&.{ .tv_sec = 0, .tv_nsec = 1_000_000 }, null);
+
+        if (target_ip == last_usable_ip) {
+            last_sent_time = std.Io.Clock.real.now(threaded_io);
         }
     }
 
@@ -233,7 +246,7 @@ pub fn LocalNetworkArpScan(hostiface: []const u8, allocator: std.mem.Allocator) 
     var frame_buff: [@sizeOf(ArpFrame)]u8 align(@alignOf(ArpFrame)) = undefined;
 
     while (true) {
-        const ready = std.os.linux.poll(&fds, 1, 1000); // 1ms
+        const ready = std.os.linux.poll(&fds, 1, 1000); // 1s
         if (ready == 0) break;
         if (std.os.linux.errno(ready) != .SUCCESS) break;
 
