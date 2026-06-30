@@ -13,6 +13,10 @@ const ARPOP_REPLY = 2;
 pub const MACBroadcastAddr: [6]u8 = "FF:FF:FF:FF:FF:FF";
 pub const MACBroadcastEthStruct = .{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
 
+// Time Constants
+const SEND_DELAY_NS = 500_000;
+const WAIT_AFTER_LAST_SENT_MS = 5000;
+
 // Host
 pub const HostInterface = struct {
     macaddr: [6]u8,
@@ -206,12 +210,12 @@ pub fn LocalNetworkArpScan(hostiface: []const u8, allocator: std.mem.Allocator) 
     var arpRequest = FormatArpRequest(host_network_interface, host_network_interface.ipaddr);
 
     // Track last sent packet
-    const last_usable_ip = usable_ips[usable_ips.len - 1];
-    const threaded_io: std.Io.Threaded = .init(allocator);
-    var last_sent_time: std.Io.Timestamp = std.Io.Clock.real.now(threaded_io);
+    var threaded_io = std.Io.Threaded.init_single_threaded;
+    const io = threaded_io.io();
+    var last_sent_time: i64 = std.Io.Clock.real.now(io).toMilliseconds();
 
     // Boardcast ARP to every known IP
-    for (usable_ips) |target_ip| {
+    for (usable_ips, 0..) |target_ip, index| {
         arpRequest.arp.tpa = target_ip;
         const raw_msg = std.mem.asBytes(&arpRequest);
 
@@ -223,12 +227,12 @@ pub fn LocalNetworkArpScan(hostiface: []const u8, allocator: std.mem.Allocator) 
             });
         }
 
-        // Pace sends by pauing for 1ms between each send and not overwhelming the TX buffer
+        // Pace sends by pauing briefly between each send and not overwhelming the TX buffer
         // TODO: Could make this cooler by tracking TX buffer state and pacing dynamically
-        std.os.linux.nanosleep(&.{ .tv_sec = 0, .tv_nsec = 1_000_000 }, null);
+        try std.Io.sleep(io, .fromNanoseconds(SEND_DELAY_NS), .awake);
 
-        if (target_ip == last_usable_ip) {
-            last_sent_time = std.Io.Clock.real.now(threaded_io);
+        if (index == usable_ips.len - 1) {
+            last_sent_time = std.Io.Clock.real.now(io).toMicroseconds();
         }
     }
 
@@ -246,7 +250,12 @@ pub fn LocalNetworkArpScan(hostiface: []const u8, allocator: std.mem.Allocator) 
     var frame_buff: [@sizeOf(ArpFrame)]u8 align(@alignOf(ArpFrame)) = undefined;
 
     while (true) {
-        const ready = std.os.linux.poll(&fds, 1, 1000); // 1s
+        // Delay for after last sent message
+        const now_ms = std.Io.Clock.real.now(io).toMilliseconds();
+        const remaining_ms = (last_sent_time + WAIT_AFTER_LAST_SENT_MS) - now_ms;
+        if (remaining_ms <= 0) break;
+
+        const ready = std.os.linux.poll(&fds, 1, 5000); // 1s
         if (ready == 0) break;
         if (std.os.linux.errno(ready) != .SUCCESS) break;
 
