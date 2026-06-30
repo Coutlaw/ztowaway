@@ -13,6 +13,10 @@ const ARPOP_REPLY = 2;
 pub const MACBroadcastAddr: [6]u8 = "FF:FF:FF:FF:FF:FF";
 pub const MACBroadcastEthStruct = .{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
 
+// Time Constants
+const SEND_DELAY_NS = 500_000;
+const WAIT_AFTER_LAST_SENT_MS = 5000;
+
 // Host
 pub const HostInterface = struct {
     macaddr: [6]u8,
@@ -167,7 +171,7 @@ pub fn FormatArpRequest(iface: HostInterface, target_ip: [4]u8) ArpFrame {
 pub fn FormatDestSockAddr(iface: HostInterface) std.os.linux.sockaddr.ll {
     return .{
         .family = std.os.linux.AF.PACKET,
-        .protocol = ETH_P_ARP,
+        .protocol = std.mem.nativeToBig(u16, ETH_P_ARP),
         .ifindex = iface.ifindex,
         .hatype = ARPHRD_ETHER,
         .pkttype = 0,
@@ -205,8 +209,13 @@ pub fn LocalNetworkArpScan(hostiface: []const u8, allocator: std.mem.Allocator) 
     // Ignore the target ip, it's just to get a non zero value
     var arpRequest = FormatArpRequest(host_network_interface, host_network_interface.ipaddr);
 
+    // Track last sent packet
+    var threaded_io = std.Io.Threaded.init_single_threaded;
+    const io = threaded_io.io();
+    var last_sent_time: i64 = std.Io.Clock.real.now(io).toMilliseconds();
+
     // Boardcast ARP to every known IP
-    for (usable_ips) |target_ip| {
+    for (usable_ips, 0..) |target_ip, index| {
         arpRequest.arp.tpa = target_ip;
         const raw_msg = std.mem.asBytes(&arpRequest);
 
@@ -216,6 +225,14 @@ pub fn LocalNetworkArpScan(hostiface: []const u8, allocator: std.mem.Allocator) 
                 target_ip[0],             target_ip[1], target_ip[2], target_ip[3],
                 std.os.linux.errno(resp),
             });
+        }
+
+        // Pace sends by pauing briefly between each send and not overwhelming the TX buffer
+        // TODO: Could make this cooler by tracking TX buffer state and pacing dynamically
+        try std.Io.sleep(io, .fromNanoseconds(SEND_DELAY_NS), .awake);
+
+        if (index == usable_ips.len - 1) {
+            last_sent_time = std.Io.Clock.real.now(io).toMicroseconds();
         }
     }
 
@@ -233,7 +250,12 @@ pub fn LocalNetworkArpScan(hostiface: []const u8, allocator: std.mem.Allocator) 
     var frame_buff: [@sizeOf(ArpFrame)]u8 align(@alignOf(ArpFrame)) = undefined;
 
     while (true) {
-        const ready = std.os.linux.poll(&fds, 1, 1000); // 1ms
+        // Delay for after last sent message
+        const now_ms = std.Io.Clock.real.now(io).toMilliseconds();
+        const remaining_ms = (last_sent_time + WAIT_AFTER_LAST_SENT_MS) - now_ms;
+        if (remaining_ms <= 0) break;
+
+        const ready = std.os.linux.poll(&fds, 1, 5000); // 1s
         if (ready == 0) break;
         if (std.os.linux.errno(ready) != .SUCCESS) break;
 
