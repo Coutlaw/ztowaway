@@ -2,7 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 
 const ztowaway = @import("ztowaway");
-const network = @import("network.zig");
+const discovery = @import("discovery.zig");
 const log_level: std.log.default_level = .debug;
 const log = std.log.scoped(.main);
 
@@ -13,7 +13,9 @@ pub fn main() !void {
     defer _ = main_allocator.deinit();
     const allocator = main_allocator.allocator();
 
-    const responded_hosts = try network.LocalNetworkArpScan(interface_name, allocator);
+    const host_network_interface = try discovery.GetHostInterfaceInfo(interface_name);
+    const responded_hosts = try discovery.LocalNetworkArpScan(allocator, host_network_interface);
+
     defer allocator.free(responded_hosts);
     for (responded_hosts) |host| {
         log.info("Host Responded: {}", .{host});

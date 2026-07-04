@@ -17,6 +17,9 @@ pub const MACBroadcastEthStruct = .{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
 const SEND_DELAY_NS = 500_000;
 const WAIT_AFTER_LAST_SENT_MS = 5000;
 
+// Linux Const
+const MISSING_SOCKET_PERMS_ERROR_CODE = 18446744073709551615;
+
 // Host
 pub const HostInterface = struct {
     macaddr: [6]u8,
@@ -29,6 +32,16 @@ pub const HostInterface = struct {
 pub const KnownHost = struct {
     macaddr: [6]u8,
     ipaddr: [4]u8,
+};
+
+// verified peers
+pub const PeerStatus = enum { known, up, down };
+pub const Peer = struct {
+    ipaddr: [4]u8,
+    macaddr: [4]u8,
+    last_seen_ms: i64,
+    missed_hb: u8,
+    status: PeerStatus,
 };
 
 // Constants for ARP frame
@@ -78,7 +91,9 @@ pub const ArpFrame = extern struct {
     arp: ArpPacket,
 };
 
-pub fn GetHostInterfaceInfo(iface: []const u8, socket: i32) !HostInterface {
+pub fn GetHostInterfaceInfo(iface: []const u8) !HostInterface {
+    const ioctl_socket: i32 = @intCast(std.os.linux.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0));
+
     // Set up the ifr (inerface request) struct with the interface name (e.g. "eth0", "enp3s0")
     var ifr = std.mem.zeroes(std.posix.ifreq); // ifreq == linux here
     if (iface.len > std.posix.IFNAMESIZE - 1) return error.InterfaceNameTooLong;
@@ -88,7 +103,7 @@ pub fn GetHostInterfaceInfo(iface: []const u8, socket: i32) !HostInterface {
     var info: HostInterface = undefined;
 
     // SIOCGIFHWADDR (network interface address aka MAC)
-    const rc = std.os.linux.ioctl(socket, std.os.linux.SIOCGIFHWADDR, @intFromPtr(&ifr));
+    const rc = std.os.linux.ioctl(ioctl_socket, std.os.linux.SIOCGIFHWADDR, @intFromPtr(&ifr));
     if (rc != 0) return error.IoctlFailed; // better error handling one day.
     @memcpy(&info.macaddr, ifr.ifru.hwaddr.data[0..6]);
     log.debug("MAC: {x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
@@ -98,14 +113,14 @@ pub fn GetHostInterfaceInfo(iface: []const u8, socket: i32) !HostInterface {
 
     // SIOCGIFINDEX (Interface Index)
     @memcpy(ifr.ifrn.name[0..iface.len], iface); // reset incase it was overwritten
-    const iirq = std.os.linux.ioctl(socket, std.os.linux.SIOCGIFINDEX, @intFromPtr(&ifr));
+    const iirq = std.os.linux.ioctl(ioctl_socket, std.os.linux.SIOCGIFINDEX, @intFromPtr(&ifr));
     if (iirq != 0) return error.IoctlFailed;
     info.ifindex = ifr.ifru.ivalue;
     log.debug("ifindex: {d}", .{info.ifindex});
 
     // SIOCGIFADDR (IP Addr)
     @memcpy(ifr.ifrn.name[0..iface.len], iface); // reset incase it was overwritten
-    const iprq = std.os.linux.ioctl(socket, std.os.linux.SIOCGIFADDR, @intFromPtr(&ifr));
+    const iprq = std.os.linux.ioctl(ioctl_socket, std.os.linux.SIOCGIFADDR, @intFromPtr(&ifr));
     if (iprq != 0) return error.IoctlFailed;
     // casting the pointer to a sockaddr.in will prevent a AF_NET byte index  on sockaddr.data[2..6]
     const sin_addr: *const std.posix.sockaddr.in = @ptrCast(&ifr.ifru.addr);
@@ -116,7 +131,7 @@ pub fn GetHostInterfaceInfo(iface: []const u8, socket: i32) !HostInterface {
 
     // SIOCGIFNETMASK (netmask)
     @memcpy(ifr.ifrn.name[0..iface.len], iface);
-    const nmrq = std.os.linux.ioctl(socket, std.os.linux.SIOCGIFNETMASK, @intFromPtr(&ifr));
+    const nmrq = std.os.linux.ioctl(ioctl_socket, std.os.linux.SIOCGIFNETMASK, @intFromPtr(&ifr));
     if (nmrq != 0) return error.IoctlFailed;
     const nm_sin: *const std.posix.sockaddr.in = @ptrCast(&ifr.ifru.addr);
     @memcpy(&info.netmask, std.mem.asBytes(&nm_sin.addr));
@@ -124,6 +139,8 @@ pub fn GetHostInterfaceInfo(iface: []const u8, socket: i32) !HostInterface {
         info.netmask[0], info.netmask[1],
         info.netmask[2], info.netmask[3],
     });
+
+    _ = std.os.linux.close(ioctl_socket);
 
     return info;
 }
@@ -180,20 +197,15 @@ pub fn FormatDestSockAddr(iface: HostInterface) std.os.linux.sockaddr.ll {
     };
 }
 
-//Eventually needs to return ![]KnownHost
-pub fn LocalNetworkArpScan(hostiface: []const u8, allocator: std.mem.Allocator) ![]KnownHost {
-    const ioctl_socket: i32 = @intCast(std.os.linux.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0));
-
-    const host_network_interface = try GetHostInterfaceInfo(hostiface, ioctl_socket);
-    const usable_ips = try GetSubnetHosts(allocator, host_network_interface.ipaddr, host_network_interface.netmask);
+pub fn LocalNetworkArpScan(allocator: std.mem.Allocator, hostiface: HostInterface) ![]KnownHost {
+    const usable_ips = try GetSubnetHosts(allocator, hostiface.ipaddr, hostiface.netmask);
     defer allocator.free(usable_ips);
-    _ = std.os.linux.close(ioctl_socket);
 
     // AF_PACKET and ETH_P_ARP will allow ARP resonses to sit in this sockets recieve buffer
     const raw_socket_rc = std.os.linux.socket(std.os.linux.AF.PACKET, std.posix.SOCK.RAW, std.mem.nativeToBig(u16, ETH_P_ARP));
     if (std.os.linux.errno(raw_socket_rc) != .SUCCESS) {
         log.debug("Error Number: {}", .{raw_socket_rc});
-        if (raw_socket_rc == 18446744073709551615) {
+        if (raw_socket_rc == MISSING_SOCKET_PERMS_ERROR_CODE) {
             log.err("Missing the Capability to use raw socket hosts, run zig build setcap to rebuild binary", .{});
             return error.RawSocketCapabilityMissing;
         }
@@ -204,10 +216,10 @@ pub fn LocalNetworkArpScan(hostiface: []const u8, allocator: std.mem.Allocator) 
     const raw_socket: i32 = @intCast(raw_socket_rc);
     defer _ = std.os.linux.close(raw_socket);
 
-    const dest_sock_addr = FormatDestSockAddr(host_network_interface);
+    const dest_sock_addr = FormatDestSockAddr(hostiface);
 
     // Ignore the target ip, it's just to get a non zero value
-    var arpRequest = FormatArpRequest(host_network_interface, host_network_interface.ipaddr);
+    var arpRequest = FormatArpRequest(hostiface, hostiface.ipaddr);
 
     // Track last sent packet
     var threaded_io = std.Io.Threaded.init_single_threaded;
@@ -249,13 +261,14 @@ pub fn LocalNetworkArpScan(hostiface: []const u8, allocator: std.mem.Allocator) 
     // Align here is just to help coerce the raw byte string into this structure without copying data
     var frame_buff: [@sizeOf(ArpFrame)]u8 align(@alignOf(ArpFrame)) = undefined;
 
+    // Find responses in the recv buffer, break 5s after last tx from above
     while (true) {
         // Delay for after last sent message
         const now_ms = std.Io.Clock.real.now(io).toMilliseconds();
         const remaining_ms = (last_sent_time + WAIT_AFTER_LAST_SENT_MS) - now_ms;
         if (remaining_ms <= 0) break;
 
-        const ready = std.os.linux.poll(&fds, 1, 5000); // 1s
+        const ready = std.os.linux.poll(&fds, 1, 5000); // 5s
         if (ready == 0) break;
         if (std.os.linux.errno(ready) != .SUCCESS) break;
 
@@ -273,6 +286,75 @@ pub fn LocalNetworkArpScan(hostiface: []const u8, allocator: std.mem.Allocator) 
     }
 
     return try known_hosts.toOwnedSlice(allocator);
+}
+
+pub const Leader = struct {
+    host: KnownHost,
+    isMe: bool,
+};
+
+// World's simplest leader election, smallest IP among active hosts is elected leader
+pub fn ElectLeader(hostiface: HostInterface, known_hosts: []const KnownHost) Leader {
+    // Current leader is just ourself temporarily
+    var current_leader = Leader{
+        .host = .{ .ipaddr = hostiface.ipaddr, .macaddr = hostiface.macaddr },
+        .isMe = true,
+    };
+    var current_ip_leader: u32 = 0;
+    var next_ip_score: u32 = 0;
+
+    for (current_leader.host.ipaddr) |v| {
+        current_ip_leader += @intCast(v);
+    }
+
+    for (known_hosts) |host| {
+        for (host.ipaddr) |v| {
+            next_ip_score += @intCast(v);
+        }
+
+        if (next_ip_score < current_ip_leader) {
+            current_leader.host.ipaddr = host.ipaddr;
+            current_leader.host.macaddr = host.macaddr;
+            current_leader.isMe = false;
+            current_ip_leader = next_ip_score; //pass by value obvs
+        }
+    }
+
+    return current_leader;
+}
+
+test "leader election test, not me" {
+    const know_hosts = [4]KnownHost{
+        KnownHost{ .ipaddr = [4]u8{ 192, 168, 1, 1 }, .macaddr = [6]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF2 } },
+        KnownHost{ .ipaddr = [4]u8{ 192, 168, 1, 2 }, .macaddr = [6]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF3 } },
+        KnownHost{ .ipaddr = [4]u8{ 192, 168, 1, 3 }, .macaddr = [6]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF4 } },
+        KnownHost{ .ipaddr = [4]u8{ 192, 168, 1, 4 }, .macaddr = [6]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF5 } },
+    };
+
+    const hostiface = HostInterface{ .ipaddr = [4]u8{ 192, 168, 1, 10 }, .macaddr = [6]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF2 }, .ifindex = 0, .netmask = [4]u8{ 255, 255, 255, 254 } };
+
+    const leader_result = ElectLeader(hostiface, &know_hosts);
+
+    try std.testing.expectEqual(false, leader_result.isMe);
+    try std.testing.expectEqual([4]u8{ 192, 168, 1, 1 }, leader_result.host.ipaddr);
+    try std.testing.expectEqual([6]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF2 }, leader_result.host.macaddr);
+}
+
+test "leader election test, is me" {
+    const know_hosts = [4]KnownHost{
+        KnownHost{ .ipaddr = [4]u8{ 192, 168, 1, 1 }, .macaddr = [6]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF2 } },
+        KnownHost{ .ipaddr = [4]u8{ 192, 168, 1, 2 }, .macaddr = [6]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF3 } },
+        KnownHost{ .ipaddr = [4]u8{ 192, 168, 1, 3 }, .macaddr = [6]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF4 } },
+        KnownHost{ .ipaddr = [4]u8{ 192, 168, 1, 4 }, .macaddr = [6]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF5 } },
+    };
+
+    const hostiface = HostInterface{ .ipaddr = [4]u8{ 192, 168, 0, 10 }, .macaddr = [6]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF2 }, .ifindex = 0, .netmask = [4]u8{ 255, 255, 255, 254 } };
+
+    const leader_result = ElectLeader(hostiface, &know_hosts);
+
+    try std.testing.expectEqual(false, leader_result.isMe);
+    try std.testing.expectEqual([4]u8{ 192, 168, 1, 1 }, leader_result.host.ipaddr);
+    try std.testing.expectEqual([6]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF2 }, leader_result.host.macaddr);
 }
 
 test "subnet hosts happy path" {
