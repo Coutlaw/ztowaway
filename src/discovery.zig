@@ -20,6 +20,9 @@ const WAIT_AFTER_LAST_SENT_MS = 5000;
 // Linux Const
 const MISSING_SOCKET_PERMS_ERROR_CODE = 18446744073709551615;
 
+// Discovery Constants
+const PROBE_INTERVAL_SECONDS = 5;
+
 // Host
 pub const HostInterface = struct {
     macaddr: [6]u8,
@@ -43,6 +46,89 @@ pub const Peer = struct {
     missed_hb: u8,
     status: PeerStatus,
 };
+
+// Registry used to track up/down instances of ztowaway agents
+pub const Registry = struct {
+    mutext: std.Io.Mutex = .{},
+    peers: std.AutoHashMap([4]u8, Peer), // Zig supports structural hashing, pretty cool
+    // Need this for 0.16 mutex usage
+    io: std.Io,
+
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) Registry {
+        return .{ .peers = std.AutoHashMap([4]u8, Peer).init(allocator), .io = io };
+    }
+
+    pub fn markUp(self: *Registry, ip: [4]u8, mac: [6]u8) !bool {
+        // for now, not using cancellable locks so no need to try/catch
+        self.mutext.lock(self.io);
+        defer self.mutext.unlock(self.io);
+
+        const now: i64 = std.Io.Clock.real.now(self.io).toMilliseconds();
+
+        // inform if this was a down instance transfering to up
+        const is_new_peer = if (self.peers.getPtr(ip)) |p| p.status == .up else false;
+
+        try self.peers.put(ip, .{
+            .ip = ip,
+            .mac = mac,
+            .last_seen_ms = now,
+            .missed = 0,
+            .status = .up,
+        });
+
+        return !is_new_peer;
+    }
+
+    pub fn markMissed(self: *Registry, ip: [4]u8) void {
+        self.mutext.lock(self.io);
+        defer self.mutext.unlock(self.io);
+        if (self.peers.getPtr(ip)) |p| {
+            p.missed_hb += 1;
+            if (p.missed_hb >= 3) p.status = .down;
+        }
+    }
+
+    pub fn snapshotUp(self: *Registry, allocator: std.mem.Allocator) ![]Peer {
+        self.mutext.lock(self.io);
+        defer self.mutex.unlock(self.io);
+
+        var up_list = std.ArrayList(Peer).empty;
+        defer up_list.deinit(allocator);
+
+        var itterator = self.peers.valueIterator(); // ensures if my type changes this code should survive
+
+        while (itterator.next()) |p| {
+            if (p.status == .up) try up_list.append(allocator, p.*);
+        }
+
+        return up_list.toOwnedSlice(allocator);
+    }
+};
+
+pub fn discoveryLoop(
+    registry: *Registry,
+    known_hosts: []KnownHost,
+    udp_socket: std.os.linux.socket_t,
+    on_discovery: *const fn (Peer) void,
+) void {
+    const probe_interval_ns: i128 = PROBE_INTERVAL_SECONDS * std.time.ns_per_s;
+    var last_probe_time: i128 = 0;
+
+    var fds = [_]std.os.linux.pollfd{.{
+        .fd = udp_socket,
+        .events = std.os.linux.POLL.IN,
+        .revents = 0,
+    }};
+
+    while (true) {
+        const now: i64 = std.Io.Clock.real.now(registry.io).toMilliseconds();
+
+        if (now - last_probe_time >= probe_interval_ns) {
+            // TODO: send probe here
+            last_probe_time = now;
+        }
+    }
+}
 
 // Constants for ARP frame
 // TODO: use these once I figure out endiness for the encoded frame
@@ -165,6 +251,35 @@ pub fn GetSubnetHosts(allocator: std.mem.Allocator, ip: [4]u8, mask: [4]u8) ![][
     }
 
     return hosts;
+}
+
+test "subnet hosts happy path" {
+    var debug_allocator = std.heap.DebugAllocator(.{}){};
+    defer _ = debug_allocator.deinit();
+    const allocator = debug_allocator.allocator();
+
+    const mask: [4]u8 = [4]u8{ 255, 255, 255, 248 };
+    const host_ip: [4]u8 = [4]u8{ 192, 168, 1, 1 };
+
+    const hosts = try GetSubnetHosts(allocator, host_ip, mask);
+    defer allocator.free(hosts);
+
+    const expectedHosts: [6][4]u8 = [6][4]u8{
+        [4]u8{ 192, 168, 1, 1 },
+        [4]u8{ 192, 168, 1, 2 },
+        [4]u8{ 192, 168, 1, 3 },
+        [4]u8{ 192, 168, 1, 4 },
+        [4]u8{ 192, 168, 1, 5 },
+        [4]u8{ 192, 168, 1, 6 },
+    };
+
+    try std.testing.expectEqual(hosts.len, expectedHosts.len);
+
+    for (0..hosts.len) |i| {
+        for (0..4) |j| {
+            try std.testing.expectEqual(hosts[i][j], expectedHosts[i][j]);
+        }
+    }
 }
 
 pub fn FormatArpRequest(iface: HostInterface, target_ip: [4]u8) ArpFrame {
@@ -355,33 +470,4 @@ test "leader election test, is me" {
     try std.testing.expectEqual(false, leader_result.isMe);
     try std.testing.expectEqual([4]u8{ 192, 168, 1, 1 }, leader_result.host.ipaddr);
     try std.testing.expectEqual([6]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF2 }, leader_result.host.macaddr);
-}
-
-test "subnet hosts happy path" {
-    var debug_allocator = std.heap.DebugAllocator(.{}){};
-    defer _ = debug_allocator.deinit();
-    const allocator = debug_allocator.allocator();
-
-    const mask: [4]u8 = [4]u8{ 255, 255, 255, 248 };
-    const host_ip: [4]u8 = [4]u8{ 192, 168, 1, 1 };
-
-    const hosts = try GetSubnetHosts(allocator, host_ip, mask);
-    defer allocator.free(hosts);
-
-    const expectedHosts: [6][4]u8 = [6][4]u8{
-        [4]u8{ 192, 168, 1, 1 },
-        [4]u8{ 192, 168, 1, 2 },
-        [4]u8{ 192, 168, 1, 3 },
-        [4]u8{ 192, 168, 1, 4 },
-        [4]u8{ 192, 168, 1, 5 },
-        [4]u8{ 192, 168, 1, 6 },
-    };
-
-    try std.testing.expectEqual(hosts.len, expectedHosts.len);
-
-    for (0..hosts.len) |i| {
-        for (0..4) |j| {
-            try std.testing.expectEqual(hosts[i][j], expectedHosts[i][j]);
-        }
-    }
 }

@@ -16,6 +16,7 @@ pub fn main() !void {
     const host_network_interface = try discovery.GetHostInterfaceInfo(interface_name);
     const responded_hosts = try discovery.LocalNetworkArpScan(allocator, host_network_interface);
 
+    // TODO: make this not a defer and clean up after I am done with responded_hosts
     defer allocator.free(responded_hosts);
     for (responded_hosts) |host| {
         log.info("Host Responded: {}", .{host});
