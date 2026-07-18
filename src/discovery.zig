@@ -22,6 +22,8 @@ const MISSING_SOCKET_PERMS_ERROR_CODE = 18446744073709551615;
 
 // Discovery Constants
 const PROBE_INTERVAL_SECONDS = 5;
+const DISCOVERY_PORT: u16 = 9999;
+const PROBE_MAGIC: u36 = 0x42069; // later I will convert this to a secret
 
 // Host
 pub const HostInterface = struct {
@@ -29,6 +31,17 @@ pub const HostInterface = struct {
     ipaddr: [4]u8,
     netmask: [4]u8,
     ifindex: i32,
+};
+
+// Discovery
+pub const MsgKind = enum(u8) { probe = 0, reply = 1 };
+
+pub const DiscoveryMessage = extern struct {
+    magic: u36,
+    version: u8,
+    kind: u8,
+    _pad: u16 = 0,
+    instance_id: u64,
 };
 
 // Discovered Host: A host that responds to an ARP frame
@@ -79,6 +92,8 @@ pub const Registry = struct {
         return !is_new_peer;
     }
 
+    // The idea here is that we will check 3 times for a missed heartbeat
+    // after that we mark it down, since its UDP we may drop some packets
     pub fn markMissed(self: *Registry, ip: [4]u8) void {
         self.mutext.lock(self.io);
         defer self.mutext.unlock(self.io);
@@ -95,8 +110,8 @@ pub const Registry = struct {
         var up_list = std.ArrayList(Peer).empty;
         defer up_list.deinit(allocator);
 
-        var itterator = self.peers.valueIterator(); // ensures if my type changes this code should survive
-
+        // ensures if my type changes this code should survive
+        var itterator = self.peers.valueIterator();
         while (itterator.next()) |p| {
             if (p.status == .up) try up_list.append(allocator, p.*);
         }
@@ -105,14 +120,26 @@ pub const Registry = struct {
     }
 };
 
+pub fn handleReply(socket: std.os.linux.socket_t, registry: *Registry) !Peer {}
+
+pub fn sendProbes(socket: std.os.linux.socket_t, hosts: []KnownHost) !void {}
+
 pub fn discoveryLoop(
     registry: *Registry,
     known_hosts: []KnownHost,
-    udp_socket: std.os.linux.socket_t,
     on_discovery: *const fn (Peer) void,
 ) void {
     const probe_interval_ns: i128 = PROBE_INTERVAL_SECONDS * std.time.ns_per_s;
     var last_probe_time: i128 = 0;
+
+    const udp_socket_rc = std.os.linux.socket(std.os.linux.AF.INET, std.posix.SOCK.DGRAM, std.mem.nativeToBig(u16, std.posix.IPPROTO.UDP));
+    if (std.os.linux.errno(udp_socket_rc) != .SUCCESS) {
+        log.debug("Error Number: {}", .{raw_socket_rc});
+        return error.SocketFailed;
+    }
+
+    const udp_socket: i32 = @intCast(udp_socket_rc);
+    defer _ = std.os.linux.close(udp_socket);
 
     var fds = [_]std.os.linux.pollfd{.{
         .fd = udp_socket,
@@ -124,8 +151,21 @@ pub fn discoveryLoop(
         const now: i64 = std.Io.Clock.real.now(registry.io).toMilliseconds();
 
         if (now - last_probe_time >= probe_interval_ns) {
-            // TODO: send probe here
+            try sendProbes(udp_socket, known_hosts);
             last_probe_time = now;
+        }
+
+        const elapsed = now - last_probe_time;
+        const remaining = probe_interval_ns - elapsed;
+        const timeout_ms: i32 = if (remaining > 0) @intCast(@divTrunc(remaining, std.time.ns_per_ms)) else 0;
+
+        const n = try std.os.linux.poll(&fds, 1, timeout_ms);
+
+        if (n > 0 and (fds[0].revents & std.os.linux.POLL.IN) != 0) {
+            if (try handleReply(udp_socket, registry)) |peer| {
+                registry.markUp(peer.ip, peer.mac);
+                on_discovery(peer);
+            }
         }
     }
 }
