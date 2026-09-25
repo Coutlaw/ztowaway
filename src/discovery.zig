@@ -120,9 +120,45 @@ pub const Registry = struct {
     }
 };
 
-pub fn handleReply(socket: std.os.linux.socket_t, registry: *Registry) !Peer {}
+// Helper Functions for probe message
+fn sockaddrFromIp(ip: [4]u8, port: u16) std.os.linux.sockaddr.in {
+    return .{
+        .family = std.os.linux.AF_NET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = @bitCast(ip),
+        .zero = [_]u8{0} ** 8,
+    };
+}
 
-pub fn sendProbes(socket: std.os.linux.socket_t, hosts: []KnownHost) !void {}
+//pub fn handleReply(socket: std.os.linux.socket_t, registry: *Registry) !Peer {
+
+//}
+
+pub fn sendProbes(socket: std.os.linux.socket_t, hosts: []KnownHost, our_instance_id: u64) !void {
+    var wire = DiscoveryMessage{
+        .magic = std.mem.nativeToBig(u32, MsgKind.probe),
+        .version = 1,
+        .kind = @intFromEnum(MsgKind.probe),
+        .instance_id = std.mem.nativeToBig(u64, our_instance_id),
+    };
+    const bytes = std.mem.asBytes(&wire);
+
+    for (hosts) |host| {
+        const addr = sockaddrFromIp(host.ip, DISCOVERY_PORT);
+        const rc = std.os.linux.sendto(
+            socket,
+            bytes.ptr,
+            bytes.len,
+            0,
+            @ptrCast(&addr),
+            @sizeOf(std.os.linux.sockaddr.in),
+        );
+        switch (std.os.linux.errno(rc)) {
+            .SUCCESS => {},
+            else => |err| std.log.warn("sendto failed for {any}: {}", .{ host.ipaddr, err }),
+        }
+    }
+}
 
 pub fn discoveryLoop(
     registry: *Registry,
@@ -134,7 +170,7 @@ pub fn discoveryLoop(
 
     const udp_socket_rc = std.os.linux.socket(std.os.linux.AF.INET, std.posix.SOCK.DGRAM, std.mem.nativeToBig(u16, std.posix.IPPROTO.UDP));
     if (std.os.linux.errno(udp_socket_rc) != .SUCCESS) {
-        log.debug("Error Number: {}", .{raw_socket_rc});
+        log.debug("Error Number: {}", .{std.os.linux.errno(udp_socket_rc)});
         return error.SocketFailed;
     }
 
