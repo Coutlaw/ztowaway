@@ -122,17 +122,58 @@ pub const Registry = struct {
 
 // Helper Functions for probe message
 fn sockaddrFromIp(ip: [4]u8, port: u16) std.os.linux.sockaddr.in {
-    return .{
-        .family = std.os.linux.AF_NET,
-        .port = std.mem.nativeToBig(u16, port),
-        .addr = @bitCast(ip),
-        .zero = [_]u8{0} ** 8,
-    };
+    var addr = std.mem.zeroes(std.os.linux.sockaddr.in);
+    addr.family = std.os.linux.AF.INET;
+    addr.port = std.mem.nativeToBig(u16, port);
+    addr.addr = @bitCast(ip);
+    return addr;
 }
 
-//pub fn handleReply(socket: std.os.linux.socket_t, registry: *Registry) !Peer {
+pub fn handleReply(socket: std.os.linux.socket_t, registry: *Registry, known_hosts: []const KnownHost) !?Peer {
+    var buf: [@sizeOf(DiscoveryMessage)]u8 = undefined;
+    var src_addr: std.os.linux.sockaddr.in = undefined;
+    var addr_len: u32 = @sizeOf(std.os.linux.sockaddr.in);
 
-//}
+    const rc = std.os.linux.recvfrom(socket, &buf, buf.len, 0, @ptrCast(&src_addr), &addr_len);
+
+    switch (std.os.linux.errno(rc)) {
+        .SUCCESS => {},
+        .AGAIN => return null,
+        else => |err| {
+            std.log.warn("recvfrom failed: {}", .{err});
+            return null;
+        },
+    }
+
+    if (rc != @sizeOf(DiscoveryMessage)) return null;
+
+    var msg: DiscoveryMessage = @bitCast(buf);
+    msg.magic = std.mem.bigToNative(u32, msg.magic);
+    msg.instance_id = std.mem.bigToNative(u64, msg.instance_id);
+
+    if (msg.magic != PROBE_MAGIC) return null;
+    if (msg.kind != @intFromEnum(MsgKind.reply)) return null; // Something we don't expect to reply
+
+    const ip: [4]u8 = @bitCast(src_addr.addr);
+
+    const mac = for (known_hosts) |host| {
+        if (std.mem.eql(u8, &host.ip, &ip)) break host.mac;
+    } else {
+        std.log.warn("reply from unregocnized host {any}, ignoring", .{ip});
+        return null;
+    };
+
+    const is_new = registry.markUp(ip, mac);
+    if (!is_new) return null;
+
+    return Peer{
+        .ip = ip,
+        .mac = mac,
+        .last_seen_ms = std.Io.Clock.real.now(std.io).toMilliseconds(),
+        .missed = 0,
+        .status = .up,
+    };
+}
 
 pub fn sendProbes(socket: std.os.linux.socket_t, hosts: []KnownHost, our_instance_id: u64) !void {
     var wire = DiscoveryMessage{
@@ -157,6 +198,31 @@ pub fn sendProbes(socket: std.os.linux.socket_t, hosts: []KnownHost, our_instanc
             .SUCCESS => {},
             else => |err| std.log.warn("sendto failed for {any}: {}", .{ host.ipaddr, err }),
         }
+    }
+}
+
+pub fn respondToProbes(sock: std.os.linux.socket_t, my_instance_id: 64) !void {
+    var buf: [@sizeOf(DiscoveryMessage)]u8 = undefined;
+    var src_addr: std.os.linux.sockaddr.in = undefined;
+    var addr_len: u32 = @sizeOf(std.os.linux.sockaddr.in);
+
+    while (true) {
+        const rc = std.os.linux.recvfrom(sock, &buf, buf.len, 0, @ptrCast(src_addr), &addr_len);
+        if (std.os.linux.errno(rc) != .SUCCESS) continue; // suboptimal here,
+        if (rc != @sizeOf(DiscoveryMessage)) continue;
+
+        var msg: DiscoveryMessage = @bitCast(buf);
+        msg.magic = std.mem.bigToNative(u32, msg.magic);
+        if (msg.magic != PROBE_MAGIC or msg.kind != @intFromEnum(MsgKind)) continue;
+
+        var wire = DiscoveryMessage{
+            .magic = std.mem.nativeToBig(u32, PROBE_MAGIC),
+            .version = 1,
+            .kind = @intFromEnum(MsgKind.reply),
+            .instance_id = std.mem.nativeToBig(u64, my_instance_id),
+        };
+        const reply_bytes = std.mem.asBytes(&wire);
+        _ = std.os.linux.sendto(sock, reply_bytes.ptr, reply_bytes.len, 0, @ptrCast(&src_addr), addr_len);
     }
 }
 
