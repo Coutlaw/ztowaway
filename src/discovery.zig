@@ -177,7 +177,7 @@ pub fn handleReply(socket: std.os.linux.socket_t, registry: *Registry, known_hos
 
 pub fn sendProbes(socket: std.os.linux.socket_t, hosts: []KnownHost, our_instance_id: u64) !void {
     var wire = DiscoveryMessage{
-        .magic = std.mem.nativeToBig(u32, MsgKind.probe),
+        .magic = std.mem.nativeToBig(u32, PROBE_MAGIC),
         .version = 1,
         .kind = @intFromEnum(MsgKind.probe),
         .instance_id = std.mem.nativeToBig(u64, our_instance_id),
@@ -185,7 +185,7 @@ pub fn sendProbes(socket: std.os.linux.socket_t, hosts: []KnownHost, our_instanc
     const bytes = std.mem.asBytes(&wire);
 
     for (hosts) |host| {
-        const addr = sockaddrFromIp(host.ip, DISCOVERY_PORT);
+        const addr = sockaddrFromIp(host.ipaddr, DISCOVERY_PORT);
         const rc = std.os.linux.sendto(
             socket,
             bytes.ptr,
@@ -226,15 +226,11 @@ pub fn respondToProbes(sock: std.os.linux.socket_t, my_instance_id: 64) !void {
     }
 }
 
-pub fn discoveryLoop(
-    registry: *Registry,
-    known_hosts: []KnownHost,
-    on_discovery: *const fn (Peer) void,
-) void {
-    const probe_interval_ns: i128 = PROBE_INTERVAL_SECONDS * std.time.ns_per_s;
+pub fn discoveryLoop(registry: *Registry, known_hosts: []KnownHost, on_discovery: *const fn (Peer) void, stop: *std.atomic.Value(bool)) !void {
+    const probe_interval_ns: i128 = PROBE_INTERVAL_SECONDS * std.time.ms_per_s;
     var last_probe_time: i128 = 0;
 
-    const udp_socket_rc = std.os.linux.socket(std.os.linux.AF.INET, std.posix.SOCK.DGRAM, std.mem.nativeToBig(u16, std.posix.IPPROTO.UDP));
+    const udp_socket_rc = std.os.linux.socket(std.os.linux.AF.INET, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP);
     if (std.os.linux.errno(udp_socket_rc) != .SUCCESS) {
         log.debug("Error Number: {}", .{std.os.linux.errno(udp_socket_rc)});
         return error.SocketFailed;
@@ -249,7 +245,7 @@ pub fn discoveryLoop(
         .revents = 0,
     }};
 
-    while (true) {
+    while (!stop.load(.acquire)) {
         const now: i64 = std.Io.Clock.real.now(registry.io).toMilliseconds();
 
         if (now - last_probe_time >= probe_interval_ns) {
@@ -259,7 +255,7 @@ pub fn discoveryLoop(
 
         const elapsed = now - last_probe_time;
         const remaining = probe_interval_ns - elapsed;
-        const timeout_ms: i32 = if (remaining > 0) @intCast(@divTrunc(remaining, std.time.ns_per_ms)) else 0;
+        const timeout_ms: i32 = if (remaining > 0) @intCast(@divTrunc(remaining, std.time.ms_per_s)) else 0;
 
         const n = try std.os.linux.poll(&fds, 1, timeout_ms);
 
